@@ -317,8 +317,8 @@ def run_pipeline(
     # 2. Ensure target database exists
     ensure_database_exists()
 
-    # 3. Connect to target database and apply schema
-    with get_connection() as conn:
+    # 3. Connect to target database specifically and apply schema
+    with get_connection(dbname="arzi") as conn:
         server_version = get_server_version(conn)
         apply_schema(conn, sc_path)
         conn.commit()
@@ -339,6 +339,9 @@ def run_pipeline(
             metrics["checksum"] = checksum
             metrics["raw_loaded"] = raw_loaded
             metrics["prepared_loaded"] = prepared_loaded
+            metrics["db_host"] = conn.info.host or "localhost"
+            metrics["db_port"] = conn.info.port or 5432
+            metrics["db_name"] = conn.info.dbname or "arzi"
 
             # 5. Validate metrics against acceptance conditions (raises ValueError on failure)
             validate_pipeline_metrics(metrics)

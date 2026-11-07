@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -31,18 +30,8 @@ def get_connection_config(dbname: str | None = None) -> dict[str, Any]:
     user = os.environ.get("PGUSER", DEFAULT_USER)
     password = os.environ.get("PGPASSWORD")
 
-    if password is None and sys.platform == "win32":
-        try:
-            import winreg
-
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
-                val, _ = winreg.QueryValueEx(key, "PGPASSWORD")
-                if val:
-                    password = str(val)
-        except OSError:
-            pass
-
-    target_database = dbname or os.environ.get("PGDATABASE", TARGET_DB)
+    # If dbname is explicitly provided, use it; otherwise fall back to PGDATABASE or TARGET_DB
+    target_database = dbname if dbname is not None else os.environ.get("PGDATABASE", TARGET_DB)
 
     config: dict[str, Any] = {
         "host": host,
@@ -57,9 +46,9 @@ def get_connection_config(dbname: str | None = None) -> dict[str, Any]:
 
 @contextmanager
 def get_connection(
-    dbname: str | None = None, autocommit: bool = False
+    dbname: str | None = TARGET_DB, autocommit: bool = False
 ) -> Iterator[psycopg.Connection]:
-    """Provide a managed PostgreSQL connection."""
+    """Provide a managed PostgreSQL connection, defaulting to the application database."""
     config = get_connection_config(dbname=dbname)
     conn = psycopg.connect(**config, autocommit=autocommit)
     try:

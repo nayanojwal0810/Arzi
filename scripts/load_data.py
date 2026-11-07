@@ -28,10 +28,14 @@ def main() -> int:
         print(f"Pipeline execution failed: {exc}", file=sys.stderr)
         return 1
 
+    db_host = metrics.get("db_host", "localhost")
+    db_port = metrics.get("db_port", 5432)
+    db_name = metrics.get("db_name", "arzi")
+
     print("============================================================")
     print("Arzi PostgreSQL Data Pipeline Summary")
     print("============================================================")
-    print("Database Connection:        Connected (localhost:5432 / arzi)")
+    print(f"Database Connection:        Connected ({db_host}:{db_port} / {db_name})")
     print(f"PostgreSQL Version:         {metrics.get('server_version', 'Unknown')}")
     print(f"Source Checksum Verified:   {metrics.get('checksum')}")
     print(f"Raw Records Loaded:         {metrics.get('raw_loaded', 0):,}")
