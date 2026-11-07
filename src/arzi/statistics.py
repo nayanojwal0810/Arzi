@@ -17,6 +17,7 @@ import scipy.stats as stats
 import statsmodels.stats.multitest as smm
 import statsmodels.stats.proportion as smp
 
+from arzi.analysis import EXPECTED_RECORD_COUNT
 from arzi.database import TARGET_DB, apply_schema, get_connection
 
 MIN_SAMPLE_SIZE = 200
@@ -175,7 +176,8 @@ def analyze_product_timeliness(
         rate_rest = (rest_timely / rest_known) if rest_known > 0 else 0.0
         rate_rest_pct = round(rate_rest * 100.0, 2)
 
-        diff_pp = round((rate - rate_rest) * 100.0, 2)
+        diff_raw_pp = (rate - rate_rest) * 100.0
+        diff_pp = round(diff_raw_pp, 2)
         ci_diff = calculate_newcombe_diff_ci(timely, known, rest_timely, rest_known)
         ci_diff_pp = (
             (round(ci_diff[0] * 100.0, 2), round(ci_diff[1] * 100.0, 2))
@@ -205,6 +207,8 @@ def analyze_product_timeliness(
             "p_value_adjusted": None,
             "is_sample_size_eligible": is_eligible,
             "meets_screening_criteria": False,
+            "_raw_diff_pp": diff_raw_pp,
+            "_raw_ci_diff": ci_diff,
         })
 
     # Adjust p-values across eligible comparisons
@@ -213,22 +217,28 @@ def analyze_product_timeliness(
         padj = adjusted_pvals[list_pos]
         evaluations[orig_idx]["p_value_adjusted"] = padj
 
-        # Screening criteria:
+        # Screening criteria evaluated on full-precision (unrounded) values:
         # - known denominator >= 200
-        # - observed rate <= other rate - 2.0 pp (difference <= -2.0)
+        # - observed rate <= other rate - 2.0 pp (unrounded diff <= -2.0)
         # - adjusted p-value < 0.05
-        # - 95% Newcombe difference interval entirely below zero
-        ci_high = evaluations[orig_idx]["newcombe_diff_ci_pp"][1]
-        diff_val = evaluations[orig_idx]["difference_pp"]
+        # - 95% Newcombe difference interval upper bound strictly below zero
+        raw_diff_val = evaluations[orig_idx]["_raw_diff_pp"]
+        raw_ci = evaluations[orig_idx]["_raw_ci_diff"]
+        raw_ci_high = (raw_ci[1] * 100.0) if raw_ci else None
 
         if (
             evaluations[orig_idx]["is_sample_size_eligible"]
-            and diff_val <= TIMELINESS_EFFECT_SIZE_PP
+            and raw_diff_val <= TIMELINESS_EFFECT_SIZE_PP
             and padj < ALPHA
-            and ci_high is not None
-            and ci_high < 0.0
+            and raw_ci_high is not None
+            and raw_ci_high < 0.0
         ):
             evaluations[orig_idx]["meets_screening_criteria"] = True
+
+    # Strip temporary raw calculation keys from final output dictionaries
+    for e in evaluations:
+        e.pop("_raw_diff_pp", None)
+        e.pop("_raw_ci_diff", None)
 
     flagged_signals = [e for e in evaluations if e["meets_screening_criteria"]]
 
@@ -276,9 +286,13 @@ def analyze_product_mix_changes(
         c2 = h2_by_prod.get(p, 0)
         combined_count = c1 + c2
 
-        s1_pct = round((c1 * 100.0) / h1_total, 2) if h1_total > 0 else 0.0
-        s2_pct = round((c2 * 100.0) / h2_total, 2) if h2_total > 0 else 0.0
-        diff_pp = round(s2_pct - s1_pct, 2)
+        s1_raw_pct = (c1 * 100.0) / h1_total if h1_total > 0 else 0.0
+        s2_raw_pct = (c2 * 100.0) / h2_total if h2_total > 0 else 0.0
+        diff_raw_pp = s2_raw_pct - s1_raw_pct
+
+        s1_pct = round(s1_raw_pct, 2)
+        s2_pct = round(s2_raw_pct, 2)
+        diff_pp = round(diff_raw_pp, 2)
 
         ci_diff = calculate_newcombe_diff_ci(c2, h2_total, c1, h1_total)
         ci_diff_pp = (
@@ -307,6 +321,8 @@ def analyze_product_mix_changes(
             "combined_count": combined_count,
             "is_sample_size_eligible": is_eligible,
             "meets_screening_criteria": False,
+            "_raw_diff_pp": diff_raw_pp,
+            "_raw_ci_diff": ci_diff,
         })
 
     # Benjamini-Hochberg adjustment across eligible mix comparisons
@@ -315,26 +331,30 @@ def analyze_product_mix_changes(
         padj = adjusted_pvals[list_pos]
         product_comparisons[orig_idx]["p_value_adjusted"] = padj
 
-        # Screening criteria:
-        # - |diff_pp| >= 2.0 percentage points
+        # Screening criteria evaluated on full-precision (unrounded) values:
+        # - |diff_raw_pp| >= 2.0 percentage points
         # - adjusted p-value < 0.05
         # - 95% Newcombe CI excludes 0
         # - combined count >= 200
-        diff_val = product_comparisons[orig_idx]["share_change_pp"]
-        ci_low, ci_high = product_comparisons[orig_idx]["newcombe_diff_ci_pp"]
+        raw_diff_val = product_comparisons[orig_idx]["_raw_diff_pp"]
+        raw_ci = product_comparisons[orig_idx]["_raw_ci_diff"]
         ci_excludes_zero = (
-            ci_low is not None
-            and ci_high is not None
-            and ((ci_low > 0 and ci_high > 0) or (ci_low < 0 and ci_high < 0))
+            raw_ci is not None
+            and ((raw_ci[0] > 0 and raw_ci[1] > 0) or (raw_ci[0] < 0 and raw_ci[1] < 0))
         )
 
         if (
             product_comparisons[orig_idx]["is_sample_size_eligible"]
-            and abs(diff_val) >= MIX_EFFECT_SIZE_PP
+            and abs(raw_diff_val) >= MIX_EFFECT_SIZE_PP
             and padj < ALPHA
             and ci_excludes_zero
         ):
             product_comparisons[orig_idx]["meets_screening_criteria"] = True
+
+    # Strip temporary raw calculation keys from final output dictionaries
+    for m in product_comparisons:
+        m.pop("_raw_diff_pp", None)
+        m.pop("_raw_ci_diff", None)
 
     flagged_signals = [m for m in product_comparisons if m["meets_screening_criteria"]]
 
@@ -459,8 +479,108 @@ def validate_statistical_metrics(
         if not (0.0 <= top3_share <= 100.0):
             errors.append(f"Top 3 share ({top3_share}%) out of bounds for {item['product']}")
 
+    # 4. Screening rules satisfaction check
+    for item in timeliness_data.get("flagged_signals", []):
+        if not item.get("is_sample_size_eligible"):
+            errors.append(f"Flagged timeliness signal {item.get('product')} fails sample size condition")
+        if item.get("difference_pp", 0) > TIMELINESS_EFFECT_SIZE_PP:
+            errors.append(f"Flagged timeliness signal {item.get('product')} fails effect size condition")
+        if item.get("p_value_adjusted", 1.0) >= ALPHA:
+            errors.append(f"Flagged timeliness signal {item.get('product')} fails significance threshold")
+        ci_high = item.get("newcombe_diff_ci_pp", (None, None))[1]
+        if ci_high is None or ci_high >= 0.0:
+            errors.append(f"Flagged timeliness signal {item.get('product')} fails CI below zero condition")
+
+    for item in mix_data.get("flagged_signals", []):
+        if not item.get("is_sample_size_eligible"):
+            errors.append(f"Flagged mix signal {item.get('product')} fails sample size condition")
+        if abs(item.get("share_change_pp", 0)) < MIX_EFFECT_SIZE_PP:
+            errors.append(f"Flagged mix signal {item.get('product')} fails effect size condition")
+        if item.get("p_value_adjusted", 1.0) >= ALPHA:
+            errors.append(f"Flagged mix signal {item.get('product')} fails significance threshold")
+        ci_low, ci_high = item.get("newcombe_diff_ci_pp", (None, None))
+        if ci_low is None or ci_high is None or (ci_low <= 0 and ci_high >= 0):
+            errors.append(f"Flagged mix signal {item.get('product')} fails CI excludes zero condition")
+
     if errors:
         raise ValueError("Statistical metrics validation failed:\n" + "\n".join(f"  - {e}" for e in errors))
+
+
+def verify_source_statistical_totals(
+    timeliness_data: dict[str, Any],
+    mix_data: dict[str, Any],
+) -> None:
+    """Independently verify statistical core counts directly against simple queries from arzi.complaints."""
+    errors: list[str] = []
+    with get_connection(dbname=TARGET_DB) as conn:
+        with conn.cursor() as cur:
+            # 1. Total complaints = 117,214
+            cur.execute("SELECT COUNT(*) FROM arzi.complaints;")
+            total_source_count = cur.fetchone()[0]
+            if total_source_count != EXPECTED_RECORD_COUNT:
+                errors.append(
+                    f"Source count mismatch: expected {EXPECTED_RECORD_COUNT:,}, got {total_source_count:,}"
+                )
+
+            # 2. Response breakdown: timely + untimely + unknown = source count, known = timely + untimely
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE timely_response = TRUE) AS timely,
+                    COUNT(*) FILTER (WHERE timely_response = FALSE) AS untimely,
+                    COUNT(*) FILTER (WHERE timely_response IS NULL) AS unknown,
+                    COUNT(*) FILTER (WHERE timely_response IS NOT NULL) AS known
+                FROM arzi.complaints;
+                """
+            )
+            timely, untimely, unknown, known = cur.fetchone()
+            if (timely + untimely + unknown) != total_source_count:
+                errors.append(
+                    f"Timely breakdown mismatch: timely({timely}) + untimely({untimely}) + unknown({unknown}) != {total_source_count}"
+                )
+            if known != (timely + untimely):
+                errors.append(f"Known responses ({known}) != timely({timely}) + untimely({untimely})")
+            if timeliness_data.get("overall_known_denominator") != known:
+                errors.append(
+                    f"Timeliness denominator ({timeliness_data.get('overall_known_denominator')}) != database known ({known})"
+                )
+
+            # 3. Product response counts sum to source count
+            prod_complaints_sum = sum(int(e.get("complaint_count", 0)) for e in timeliness_data.get("evaluations", []))
+            if prod_complaints_sum != total_source_count:
+                errors.append(
+                    f"Product complaint counts sum ({prod_complaints_sum:,}) does not equal source total ({total_source_count:,})"
+                )
+
+            # 4. Half-year totals equal independent counts for 2019 H1 and H2
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM arzi.complaints
+                WHERE date_received >= '2019-01-01' AND date_received <= '2019-06-30';
+                """
+            )
+            h1_source = cur.fetchone()[0]
+            if mix_data.get("h1_total") != h1_source:
+                errors.append(f"H1 total ({mix_data.get('h1_total')}) != independent H1 query ({h1_source})")
+
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM arzi.complaints
+                WHERE date_received >= '2019-07-01' AND date_received <= '2019-12-31';
+                """
+            )
+            h2_source = cur.fetchone()[0]
+            if mix_data.get("h2_total") != h2_source:
+                errors.append(f"H2 total ({mix_data.get('h2_total')}) != independent H2 query ({h2_source})")
+
+            # 5. January 2020 is excluded from both half-year totals
+            cur.execute("SELECT COUNT(*) FROM arzi.complaints WHERE date_received >= '2020-01-01';")
+            jan_2020_count = cur.fetchone()[0]
+            if total_source_count - (h1_source + h2_source) != jan_2020_count:
+                errors.append("Inconsistent date coverage: non-2019 records do not match January 2020 count")
+
+    if errors:
+        raise ValueError("Source statistical verification failed:\n" + "\n".join(f"  - {e}" for e in errors))
 
 
 def build_evidence_findings(
@@ -683,6 +803,7 @@ def run_full_statistical_analysis(
 
     # 4. Validate metrics
     validate_statistical_metrics(timeliness_data, mix_data, concentration_data)
+    verify_source_statistical_totals(timeliness_data, mix_data)
 
     # 5. Build evidence findings
     findings = build_evidence_findings(timeliness_data, mix_data, concentration_data)

@@ -257,3 +257,74 @@ def test_validate_statistical_metrics_catches_invalid_bounds() -> None:
 
     with pytest.raises(ValueError, match="Invalid Wilson CI bounds"):
         validate_statistical_metrics(timeliness_data, mix_data, concentration_data)
+
+
+def test_unrounded_screening_boundary_timeliness() -> None:
+    # Baseline: 100,000 / 100,000 = 100.0% timely
+    # Product A: 9801 / 10000 = 98.01% -> diff = -1.99 pp (fails threshold)
+    # Product B: 9790 / 10000 = 97.90% -> diff = -2.10 pp (meets threshold)
+    rows_a = [
+        {
+            "product": "Product A",
+            "complaint_count": 10000,
+            "known_response_count": 10000,
+            "timely_count": 9801,
+            "untimely_count": 199,
+            "unknown_response_count": 0,
+        },
+        {
+            "product": "Baseline",
+            "complaint_count": 100000,
+            "known_response_count": 100000,
+            "timely_count": 100000,
+            "untimely_count": 0,
+            "unknown_response_count": 0,
+        },
+    ]
+
+    evals_a = {e["product"]: e for e in analyze_product_timeliness(rows_a)["evaluations"]}
+    assert evals_a["Product A"]["meets_screening_criteria"] is False
+
+    rows_b = [
+        {
+            "product": "Product B",
+            "complaint_count": 10000,
+            "known_response_count": 10000,
+            "timely_count": 9790,
+            "untimely_count": 210,
+            "unknown_response_count": 0,
+        },
+        {
+            "product": "Baseline",
+            "complaint_count": 100000,
+            "known_response_count": 100000,
+            "timely_count": 100000,
+            "untimely_count": 0,
+            "unknown_response_count": 0,
+        },
+    ]
+
+    evals_b = {e["product"]: e for e in analyze_product_timeliness(rows_b)["evaluations"]}
+    assert evals_b["Product B"]["meets_screening_criteria"] is True
+
+
+def test_unrounded_screening_boundary_mix() -> None:
+    # H1 total = 100,000, H2 total = 100,000
+    # P1: H1 = 10,000 (10.0%), H2 = 11,996 (11.996%) -> unrounded diff = +1.996 pp
+    # Display rounding shows +2.00 pp, but unrounded < 2.0 pp, so must NOT meet screening.
+    # P2: H1 = 10,000 (10.0%), H2 = 12,050 (12.050%) -> unrounded diff = +2.050 pp, meets screening.
+    synthetic_half_year = [
+        {"period": "2019_h1", "product": "P1", "complaint_count": 10000, "period_total": 100000},
+        {"period": "2019_h1", "product": "P2", "complaint_count": 10000, "period_total": 100000},
+        {"period": "2019_h1", "product": "P3", "complaint_count": 80000, "period_total": 100000},
+        {"period": "2019_h2", "product": "P1", "complaint_count": 11996, "period_total": 100000},
+        {"period": "2019_h2", "product": "P2", "complaint_count": 12050, "period_total": 100000},
+        {"period": "2019_h2", "product": "P3", "complaint_count": 75954, "period_total": 100000},
+    ]
+
+    mix = analyze_product_mix_changes(synthetic_half_year)
+    comps = {c["product"]: c for c in mix["product_comparisons"]}
+
+    assert comps["P1"]["share_change_pp"] == 2.0
+    assert comps["P1"]["meets_screening_criteria"] is False
+    assert comps["P2"]["meets_screening_criteria"] is True

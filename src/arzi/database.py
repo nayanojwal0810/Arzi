@@ -134,7 +134,21 @@ def load_prepared_records_copy(
 def truncate_target_tables(conn: psycopg.Connection) -> None:
     """Safely truncate project tables for repeatable reloading within a transaction."""
     with conn.cursor() as cur:
-        cur.execute("TRUNCATE TABLE arzi.complaints, arzi.complaints_raw;")
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'arzi' AND table_name = 'complaint_topics'
+                ) THEN
+                    TRUNCATE TABLE arzi.complaint_topics, arzi.complaints, arzi.complaints_raw;
+                ELSE
+                    TRUNCATE TABLE arzi.complaints, arzi.complaints_raw;
+                END IF;
+            END $$;
+            """
+        )
 
 
 def run_validation_checks(conn: psycopg.Connection) -> dict[str, Any]:
