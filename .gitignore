@@ -1,0 +1,49 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data directories
+data/raw/
+data/processed/
+data/interim/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Build and packaging
+*.egg-info/
+build/
+dist/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Environment and credentials
+.env
+.env.*
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Model files and machine learning artifacts
+*.pkl
+*.joblib
+*.onnx
+*.pt
+*.pth
+*.bin
+
+# Local caches and blueprint/notes
+.cache/
+Financial_Complaint_Intelligence_Project_Blueprint.txt
+
