@@ -48,7 +48,6 @@ def check_partial_month(month_date: date | str, max_dataset_date: date | str) ->
         max_dataset_date = date.fromisoformat(max_dataset_date)
 
     if (month_date.year, month_date.month) == (max_dataset_date.year, max_dataset_date.month):
-        # In January 2020, end of month would be Jan 31; max date is Jan 9
         next_month_year = month_date.year + (1 if month_date.month == 12 else 0)
         next_month_month = 1 if month_date.month == 12 else month_date.month + 1
         first_of_next = date(next_month_year, next_month_month, 1)
@@ -79,7 +78,8 @@ def fetch_product_summary() -> list[dict[str, Any]]:
                     narrative_count,
                     known_timely_response_count,
                     timely_response_rate_pct
-                FROM arzi.v_product_summary;
+                FROM arzi.v_product_summary
+                ORDER BY complaint_count DESC, product ASC;
                 """
             )
             cols = [desc[0] for desc in cur.description]
@@ -99,7 +99,8 @@ def fetch_monthly_trend() -> list[dict[str, Any]]:
                     month_over_month_change,
                     month_over_month_change_pct,
                     is_partial_last_month
-                FROM arzi.v_monthly_trend;
+                FROM arzi.v_monthly_trend
+                ORDER BY month_start ASC;
                 """
             )
             cols = [desc[0] for desc in cur.description]
@@ -116,7 +117,8 @@ def fetch_monthly_product_trend() -> list[dict[str, Any]]:
                     month_start,
                     product,
                     complaint_count
-                FROM arzi.v_monthly_product_trend;
+                FROM arzi.v_monthly_product_trend
+                ORDER BY month_start ASC, product ASC;
                 """
             )
             cols = [desc[0] for desc in cur.description]
@@ -134,7 +136,8 @@ def fetch_issue_summary() -> list[dict[str, Any]]:
                     issue,
                     complaint_count,
                     product_complaint_share_pct
-                FROM arzi.v_issue_summary;
+                FROM arzi.v_issue_summary
+                ORDER BY product ASC, complaint_count DESC, issue ASC;
                 """
             )
             cols = [desc[0] for desc in cur.description]
@@ -152,7 +155,7 @@ def fetch_top_issues_overall(limit: int = 10) -> list[dict[str, Any]]:
                     SUM(complaint_count) AS complaint_count
                 FROM arzi.v_issue_summary
                 GROUP BY issue
-                ORDER BY complaint_count DESC
+                ORDER BY complaint_count DESC, issue ASC
                 LIMIT %s;
                 """,
                 (limit,),
@@ -173,10 +176,13 @@ def fetch_company_summary(limit: int | None = None) -> list[dict[str, Any]]:
                     known_timely_response_count,
                     timely_response_rate_pct
                 FROM arzi.v_company_summary
+                ORDER BY complaint_count DESC, company ASC
             """
             if limit:
-                query += f" LIMIT {limit}"
-            cur.execute(query)
+                query += " LIMIT %s"
+                cur.execute(query, (limit,))
+            else:
+                cur.execute(query)
             cols = [desc[0] for desc in cur.description]
             return [dict(zip(cols, row)) for row in cur.fetchall()]
 
@@ -192,7 +198,8 @@ def fetch_response_summary() -> list[dict[str, Any]]:
                     company_response_to_consumer,
                     complaint_count,
                     product_response_share_pct
-                FROM arzi.v_response_summary;
+                FROM arzi.v_response_summary
+                ORDER BY product ASC, complaint_count DESC, company_response_to_consumer ASC;
                 """
             )
             cols = [desc[0] for desc in cur.description]
@@ -209,7 +216,8 @@ def fetch_channel_summary() -> list[dict[str, Any]]:
                     submitted_via,
                     complaint_count,
                     complaint_share_pct
-                FROM arzi.v_channel_summary;
+                FROM arzi.v_channel_summary
+                ORDER BY complaint_count DESC, submitted_via ASC;
                 """
             )
             cols = [desc[0] for desc in cur.description]
@@ -222,6 +230,7 @@ def validate_analysis_metrics(
     issue_rows: list[dict[str, Any]],
     response_rows: list[dict[str, Any]],
     channel_rows: list[dict[str, Any]],
+    monthly_product_rows: list[dict[str, Any]] | None = None,
 ) -> None:
     """Validate cross-view record and percentage consistency against acceptance rules."""
     errors: list[str] = []
@@ -233,13 +242,19 @@ def validate_analysis_metrics(
     response_total = sum(int(r["complaint_count"]) for r in response_rows)
     channel_total = sum(int(r["complaint_count"]) for r in channel_rows)
 
-    for name, total in [
+    check_list = [
         ("product summary", product_total),
         ("monthly trend", monthly_total),
         ("issue summary", issue_total),
         ("response summary", response_total),
         ("channel summary", channel_total),
-    ]:
+    ]
+
+    if monthly_product_rows is not None:
+        monthly_prod_total = sum(int(r["complaint_count"]) for r in monthly_product_rows)
+        check_list.append(("monthly product trend", monthly_prod_total))
+
+    for name, total in check_list:
         if total != EXPECTED_RECORD_COUNT:
             errors.append(
                 f"{name} count mismatch: expected {EXPECTED_RECORD_COUNT:,}, got {total:,}"
@@ -254,11 +269,95 @@ def validate_analysis_metrics(
             errors.append(
                 "Partial last month must have NULL month_over_month_change_pct"
             )
+        if last_month.get("month_over_month_change") is not None:
+            errors.append(
+                "Partial last month must have NULL month_over_month_change"
+            )
 
-    # 3. Product share percentage sum check (~100%)
+    # 3. Product-level count reconciliations
+    product_counts = {r["product"]: int(r["complaint_count"]) for r in product_rows}
+
+    # Sum of issues per product = product complaint count
+    issues_by_prod: dict[str, int] = {}
+    issue_shares_by_prod: dict[str, list[float]] = {}
+    for r in issue_rows:
+        prod = r["product"]
+        issues_by_prod[prod] = issues_by_prod.get(prod, 0) + int(r["complaint_count"])
+        if r.get("product_complaint_share_pct") is not None:
+            issue_shares_by_prod.setdefault(prod, []).append(float(r["product_complaint_share_pct"]))
+
+    for prod, expected_cnt in product_counts.items():
+        actual_cnt = issues_by_prod.get(prod, 0)
+        if actual_cnt != expected_cnt:
+            errors.append(
+                f"Product '{prod}' issue count sum ({actual_cnt:,}) does not match product count ({expected_cnt:,})"
+            )
+        shares = issue_shares_by_prod.get(prod, [])
+        if shares:
+            share_sum = sum(shares)
+            tolerance = len(shares) * 0.005 + 0.02
+            if abs(share_sum - 100.0) > tolerance:
+                errors.append(
+                    f"Product '{prod}' issue shares sum ({share_sum:.2f}%) exceeds tolerance ({tolerance:.3f}%)"
+                )
+
+    # Sum of responses per product = product complaint count
+    responses_by_prod: dict[str, int] = {}
+    response_shares_by_prod: dict[str, list[float]] = {}
+    for r in response_rows:
+        prod = r["product"]
+        responses_by_prod[prod] = responses_by_prod.get(prod, 0) + int(r["complaint_count"])
+        if r.get("product_response_share_pct") is not None:
+            response_shares_by_prod.setdefault(prod, []).append(float(r["product_response_share_pct"]))
+
+    for prod, expected_cnt in product_counts.items():
+        actual_cnt = responses_by_prod.get(prod, 0)
+        if actual_cnt != expected_cnt:
+            errors.append(
+                f"Product '{prod}' response category count sum ({actual_cnt:,}) does not match product count ({expected_cnt:,})"
+            )
+        shares = response_shares_by_prod.get(prod, [])
+        if shares:
+            share_sum = sum(shares)
+            tolerance = len(shares) * 0.005 + 0.02
+            if abs(share_sum - 100.0) > tolerance:
+                errors.append(
+                    f"Product '{prod}' response shares sum ({share_sum:.2f}%) exceeds tolerance ({tolerance:.3f}%)"
+                )
+
+    # Sum of monthly product trend per product = product complaint count
+    if monthly_product_rows is not None:
+        monthly_by_prod: dict[str, int] = {}
+        for r in monthly_product_rows:
+            prod = r["product"]
+            monthly_by_prod[prod] = monthly_by_prod.get(prod, 0) + int(r["complaint_count"])
+        for prod, expected_cnt in product_counts.items():
+            actual_cnt = monthly_by_prod.get(prod, 0)
+            if actual_cnt != expected_cnt:
+                errors.append(
+                    f"Product '{prod}' monthly trend sum ({actual_cnt:,}) does not match product count ({expected_cnt:,})"
+                )
+
+    # 4. Overall percentage sum checks (~100%)
     product_share_sum = sum(float(r["complaint_share_pct"]) for r in product_rows)
-    if not (99.0 <= product_share_sum <= 101.0):
+    prod_tolerance = len(product_rows) * 0.005 + 0.02
+    if abs(product_share_sum - 100.0) > prod_tolerance:
         errors.append(f"Product share percentage sum out of bounds: {product_share_sum:.2f}%")
+
+    channel_share_sum = sum(float(r["complaint_share_pct"]) for r in channel_rows)
+    chan_tolerance = len(channel_rows) * 0.005 + 0.02
+    if abs(channel_share_sum - 100.0) > chan_tolerance:
+        errors.append(f"Channel share percentage sum out of bounds: {channel_share_sum:.2f}%")
+
+    # 5. Timely response checks
+    for r in product_rows:
+        known = int(r.get("known_timely_response_count", 0))
+        cnt = int(r["complaint_count"])
+        if known > cnt:
+            errors.append(f"Known timely response count ({known}) exceeds complaint count ({cnt}) for {r['product']}")
+        rate = r.get("timely_response_rate_pct")
+        if known > 0 and rate is not None and not (0.0 <= float(rate) <= 100.0):
+            errors.append(f"Timely response rate {rate}% out of bounds for {r['product']}")
 
     if errors:
         raise ValueError("Analysis metrics validation failed:\n" + "\n".join(f"  - {e}" for e in errors))
@@ -399,7 +498,6 @@ def generate_charts(
     ax.tick_params(axis="x", rotation=45)
     ax.grid(axis="y", linestyle="--", alpha=0.6)
 
-    # Annotate partial final month
     for bar, partial, count in zip(bars, is_partial, counts):
         if partial:
             ax.annotate(
@@ -504,6 +602,7 @@ def run_full_analysis(
     # 2. Fetch results from views
     products = fetch_product_summary()
     monthly = fetch_monthly_trend()
+    monthly_products = fetch_monthly_product_trend()
     issues = fetch_issue_summary()
     top_issues = fetch_top_issues_overall(limit=10)
     companies = fetch_company_summary(limit=10)
@@ -511,7 +610,14 @@ def run_full_analysis(
     channels = fetch_channel_summary()
 
     # 3. Validate metrics consistency
-    validate_analysis_metrics(products, monthly, issues, responses, channels)
+    validate_analysis_metrics(
+        product_rows=products,
+        monthly_rows=monthly,
+        issue_rows=issues,
+        response_rows=responses,
+        channel_rows=channels,
+        monthly_product_rows=monthly_products,
+    )
 
     # 4. Generate EDA charts
     generate_charts(monthly, products, top_issues, charts_dir)

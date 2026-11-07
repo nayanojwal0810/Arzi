@@ -19,7 +19,7 @@ SELECT
     ) AS timely_response_rate_pct
 FROM arzi.complaints
 GROUP BY product
-ORDER BY complaint_count DESC;
+ORDER BY complaint_count DESC, product ASC;
 
 -- View 2: Monthly Trend
 CREATE OR REPLACE VIEW arzi.v_monthly_trend AS
@@ -51,7 +51,7 @@ lagged AS (
         mc.month_start,
         mc.complaint_count,
         LAG(mc.complaint_count) OVER (ORDER BY mc.month_start) AS previous_month_count,
-        mc.complaint_count - LAG(mc.complaint_count) OVER (ORDER BY mc.month_start) AS month_over_month_change,
+        mc.complaint_count - LAG(mc.complaint_count) OVER (ORDER BY mc.month_start) AS raw_mom_change,
         CASE
             WHEN mc.month_start = (SELECT max_month FROM date_bounds)
                  AND (SELECT max_date FROM date_bounds) < (SELECT (max_month + INTERVAL '1 month - 1 day')::DATE FROM date_bounds)
@@ -64,15 +64,18 @@ SELECT
     month_start,
     complaint_count,
     previous_month_count,
-    month_over_month_change,
+    CASE
+        WHEN is_partial_last_month THEN NULL
+        ELSE raw_mom_change
+    END AS month_over_month_change,
     CASE
         WHEN is_partial_last_month THEN NULL
         WHEN previous_month_count IS NULL OR previous_month_count <= 0 THEN NULL
-        ELSE ROUND((month_over_month_change * 100.0 / previous_month_count), 2)
+        ELSE ROUND((raw_mom_change * 100.0 / previous_month_count), 2)
     END AS month_over_month_change_pct,
     is_partial_last_month
 FROM lagged
-ORDER BY month_start;
+ORDER BY month_start ASC;
 
 -- View 3: Monthly Product Trend
 CREATE OR REPLACE VIEW arzi.v_monthly_product_trend AS
@@ -82,7 +85,7 @@ SELECT
     COUNT(*) AS complaint_count
 FROM arzi.complaints
 GROUP BY DATE_TRUNC('month', date_received)::DATE, product
-ORDER BY month_start, product;
+ORDER BY month_start ASC, product ASC;
 
 -- View 4: Issue Summary
 CREATE OR REPLACE VIEW arzi.v_issue_summary AS
@@ -96,7 +99,7 @@ SELECT
     ) AS product_complaint_share_pct
 FROM arzi.complaints
 GROUP BY product, issue
-ORDER BY product, complaint_count DESC;
+ORDER BY product ASC, complaint_count DESC, issue ASC;
 
 -- View 5: Company Summary
 CREATE OR REPLACE VIEW arzi.v_company_summary AS
@@ -111,7 +114,7 @@ SELECT
     ) AS timely_response_rate_pct
 FROM arzi.complaints
 GROUP BY company
-ORDER BY complaint_count DESC;
+ORDER BY complaint_count DESC, company ASC;
 
 -- View 6: Response Summary
 CREATE OR REPLACE VIEW arzi.v_response_summary AS
@@ -125,7 +128,7 @@ SELECT
     ) AS product_response_share_pct
 FROM arzi.complaints
 GROUP BY product, company_response_to_consumer
-ORDER BY product, complaint_count DESC;
+ORDER BY product ASC, complaint_count DESC, company_response_to_consumer ASC;
 
 -- View 7: Channel Summary
 CREATE OR REPLACE VIEW arzi.v_channel_summary AS
@@ -138,4 +141,4 @@ SELECT
     ) AS complaint_share_pct
 FROM arzi.complaints
 GROUP BY COALESCE(submitted_via, 'Unknown')
-ORDER BY complaint_count DESC;
+ORDER BY complaint_count DESC, submitted_via ASC;

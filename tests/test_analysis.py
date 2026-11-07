@@ -94,34 +94,120 @@ def test_database_selection_unrelated_pgdatabase(monkeypatch: pytest.MonkeyPatch
 
 
 def test_validate_analysis_metrics_synthetic_success() -> None:
-    products = [{"complaint_count": EXPECTED_RECORD_COUNT, "complaint_share_pct": 100.0}]
+    products = [
+        {
+            "product": "Mortgage",
+            "complaint_count": EXPECTED_RECORD_COUNT,
+            "complaint_share_pct": 100.0,
+            "known_timely_response_count": EXPECTED_RECORD_COUNT,
+            "timely_response_rate_pct": 98.0,
+        }
+    ]
     monthly = [
         {
             "complaint_count": EXPECTED_RECORD_COUNT,
             "is_partial_last_month": True,
             "month_over_month_change_pct": None,
+            "month_over_month_change": None,
         }
     ]
-    issues = [{"complaint_count": EXPECTED_RECORD_COUNT}]
-    responses = [{"complaint_count": EXPECTED_RECORD_COUNT}]
-    channels = [{"complaint_count": EXPECTED_RECORD_COUNT}]
+    issues = [
+        {
+            "product": "Mortgage",
+            "complaint_count": EXPECTED_RECORD_COUNT,
+            "product_complaint_share_pct": 100.0,
+        }
+    ]
+    responses = [
+        {
+            "product": "Mortgage",
+            "complaint_count": EXPECTED_RECORD_COUNT,
+            "product_response_share_pct": 100.0,
+        }
+    ]
+    channels = [{"complaint_count": EXPECTED_RECORD_COUNT, "complaint_share_pct": 100.0}]
 
     # Should not raise any exception
     validate_analysis_metrics(products, monthly, issues, responses, channels)
 
 
 def test_validate_analysis_metrics_failure_on_mismatch() -> None:
-    products = [{"complaint_count": 100, "complaint_share_pct": 100.0}]
+    products = [{"product": "Mortgage", "complaint_count": 100, "complaint_share_pct": 100.0}]
     monthly = [
         {
             "complaint_count": 100,
             "is_partial_last_month": False,
             "month_over_month_change_pct": 10.0,
+            "month_over_month_change": 10,
         }
     ]
-    issues = [{"complaint_count": 100}]
-    responses = [{"complaint_count": 100}]
-    channels = [{"complaint_count": 100}]
+    issues = [{"product": "Mortgage", "complaint_count": 100, "product_complaint_share_pct": 100.0}]
+    responses = [{"product": "Mortgage", "complaint_count": 100, "product_response_share_pct": 100.0}]
+    channels = [{"complaint_count": 100, "complaint_share_pct": 100.0}]
 
     with pytest.raises(ValueError, match="Analysis metrics validation failed"):
+        validate_analysis_metrics(products, monthly, issues, responses, channels)
+
+
+def test_validate_analysis_metrics_partial_month_non_null_change() -> None:
+    products = [{"complaint_count": EXPECTED_RECORD_COUNT, "complaint_share_pct": 100.0, "product": "Mortgage"}]
+    monthly = [
+        {
+            "complaint_count": EXPECTED_RECORD_COUNT,
+            "is_partial_last_month": True,
+            "month_over_month_change_pct": 5.2,  # Must be None for partial month
+            "month_over_month_change": 500,     # Must be None for partial month
+        }
+    ]
+    issues = [{"product": "Mortgage", "complaint_count": EXPECTED_RECORD_COUNT, "product_complaint_share_pct": 100.0}]
+    responses = [{"product": "Mortgage", "complaint_count": EXPECTED_RECORD_COUNT, "product_response_share_pct": 100.0}]
+    channels = [{"complaint_count": EXPECTED_RECORD_COUNT, "complaint_share_pct": 100.0}]
+
+    with pytest.raises(ValueError, match="Partial last month must have NULL"):
+        validate_analysis_metrics(products, monthly, issues, responses, channels)
+
+
+def test_validate_analysis_metrics_product_issue_count_mismatch() -> None:
+    products = [
+        {"product": "Mortgage", "complaint_count": 100000, "complaint_share_pct": 85.31},
+        {"product": "Student loan", "complaint_count": 17214, "complaint_share_pct": 14.69},
+    ]
+    monthly = [
+        {
+            "complaint_count": EXPECTED_RECORD_COUNT,
+            "is_partial_last_month": True,
+            "month_over_month_change_pct": None,
+            "month_over_month_change": None,
+        }
+    ]
+    # Issues sum to 117,214 overall, but Mortgage has 99,000 and Student loan has 18,214
+    issues = [
+        {"product": "Mortgage", "complaint_count": 99000, "product_complaint_share_pct": 100.0},
+        {"product": "Student loan", "complaint_count": 18214, "product_complaint_share_pct": 100.0},
+    ]
+    responses = [
+        {"product": "Mortgage", "complaint_count": 100000, "product_response_share_pct": 100.0},
+        {"product": "Student loan", "complaint_count": 17214, "product_response_share_pct": 100.0},
+    ]
+    channels = [{"complaint_count": EXPECTED_RECORD_COUNT, "complaint_share_pct": 100.0}]
+
+    with pytest.raises(ValueError, match="does not match product count"):
+        validate_analysis_metrics(products, monthly, issues, responses, channels)
+
+
+def test_validate_analysis_metrics_shares_exceed_tolerance() -> None:
+    products = [{"product": "Mortgage", "complaint_count": EXPECTED_RECORD_COUNT, "complaint_share_pct": 90.0}]  # 90 != ~100
+    monthly = [
+        {
+            "complaint_count": EXPECTED_RECORD_COUNT,
+            "is_partial_last_month": True,
+            "month_over_month_change_pct": None,
+            "month_over_month_change": None,
+        }
+    ]
+    issues = [{"product": "Mortgage", "complaint_count": EXPECTED_RECORD_COUNT, "product_complaint_share_pct": 100.0}]
+    responses = [{"product": "Mortgage", "complaint_count": EXPECTED_RECORD_COUNT, "product_response_share_pct": 100.0}]
+    channels = [{"complaint_count": EXPECTED_RECORD_COUNT, "complaint_share_pct": 100.0}]
+
+    with pytest.raises(ValueError, match="Product share percentage sum out of bounds"):
         validate_analysis_metrics(products, monthly, issues, responses, channels)
