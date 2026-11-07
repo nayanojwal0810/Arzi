@@ -14,11 +14,10 @@ Use Python 3.11 or newer. From the project root, run:
 
 ```bash
 python -m pip install -e ".[dev]"
-python -m pytest -q
+python -c "import arzi; print(arzi.__version__)"
 ```
 
 ## Project Structure
 
 - `src/arzi/` — Python application code.
-- `tests/` — automated checks.
 - `data/raw/` — locally stored complaint dataset, excluded from Git.
