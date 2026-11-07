@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import date
 import json
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -13,18 +15,29 @@ from sklearn.decomposition import NMF
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from arzi.nlp import (
+    CLEANING_VERSION,
+    HELD_OUT_RATIO,
+    MAX_PER_PRODUCT_SAMPLE,
     N_TOPICS,
+    NMF_PARAMS,
+    RANDOM_SEED,
+    TOP_TERMS_COUNT,
+    VECTORIZER_PARAMS,
     analyze_topic_issue_detail,
     assign_topics_to_complaints,
     clean_narrative,
     compute_reconstruction_similarity,
+    compute_source_fingerprint,
     compute_topic_diversity,
     infer_topics_for_unique_narratives,
     is_usable_narrative,
+    load_and_validate_topic_results_in_transaction,
     load_model_artifacts,
+    run_in_transaction_sql_checks,
     sample_unique_narratives,
     split_train_eval,
-    validate_nlp_results,
+    validate_in_memory_results,
+    verify_model_metadata,
 )
 
 
@@ -172,26 +185,207 @@ def test_topic_count_reconciliation() -> None:
     assert assigned_count + unassigned_count == len(complaints)
 
 
-def test_model_metadata_compatibility_check(tmp_path: Path) -> None:
-    # Write metadata with mismatching dataset count
-    incompatible_meta = {
-        "dataset_record_count": 50000,  # Expected 117214
-        "model_config": {"n_components": N_TOPICS},
+def test_reconstruction_similarity_with_zero_vectors() -> None:
+    # 1. Identical matrices should have cosine similarity 1.0
+    X_true = sparse.csr_matrix([[1.0, 0.0, 2.0], [0.0, 1.0, 0.0]])
+    X_pred = np.array([[1.0, 0.0, 2.0], [0.0, 1.0, 0.0]])
+    sim, n_docs, zero_cnt = compute_reconstruction_similarity(X_true, X_pred)
+    assert pytest.approx(sim, abs=1e-4) == 1.0
+    assert n_docs == 2
+    assert zero_cnt == 0
+
+    # 2. An additional zero-vector row must receive 0.0 similarity and lower the overall average
+    X_true_3 = sparse.csr_matrix([[1.0, 0.0, 2.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]])
+    X_pred_3 = np.array([[1.0, 0.0, 2.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]])
+    sim_3, n_docs_3, zero_cnt_3 = compute_reconstruction_similarity(X_true_3, X_pred_3)
+
+    assert sim_3 < sim
+    assert pytest.approx(sim_3, abs=1e-4) == 0.6667  # (1.0 + 1.0 + 0.0) / 3
+    assert n_docs_3 == 3
+    assert zero_cnt_3 == 1
+
+
+def test_source_fingerprint_deterministic_and_sensitive() -> None:
+    records = [
+        {
+            "complaint_id": 100,
+            "product": "Credit card",
+            "issue": "Billing",
+            "date_received": date(2019, 5, 10),
+            "consumer_complaint_narrative": "Disputed interest charge.",
+        },
+        {
+            "complaint_id": 200,
+            "product": "Mortgage",
+            "issue": "Escrow",
+            "date_received": date(2019, 6, 15),
+            "consumer_complaint_narrative": "Incorrect escrow calculation.",
+        },
+    ]
+
+    # Deterministic
+    fp1 = compute_source_fingerprint(records)
+    fp2 = compute_source_fingerprint(records)
+    assert fp1 == fp2
+    assert len(fp1) == 64
+
+    # Order-insensitive (sorted internally by complaint_id)
+    fp_reversed = compute_source_fingerprint(list(reversed(records)))
+    assert fp1 == fp_reversed
+
+    # Sensitive to text change
+    rec_modified = [dict(records[0]), dict(records[1])]
+    rec_modified[0]["consumer_complaint_narrative"] = "Different narrative"
+    assert compute_source_fingerprint(rec_modified) != fp1
+
+    # Sensitive to date change
+    rec_date = [dict(records[0]), dict(records[1])]
+    rec_date[0]["date_received"] = date(2019, 5, 11)
+    assert compute_source_fingerprint(rec_date) != fp1
+
+    # Sensitive to product change
+    rec_prod = [dict(records[0]), dict(records[1])]
+    rec_prod[0]["product"] = "Debt collection"
+    assert compute_source_fingerprint(rec_prod) != fp1
+
+    # Handles None values safely
+    rec_none = [
+        {
+            "complaint_id": 300,
+            "product": None,
+            "issue": None,
+            "date_received": None,
+            "consumer_complaint_narrative": None,
+        }
+    ]
+    fp_none = compute_source_fingerprint(rec_none)
+    assert len(fp_none) == 64
+
+
+def _build_valid_metadata() -> dict[str, Any]:
+    return {
+        "source_data_fingerprint": "a" * 64,
+        "dataset_record_count": 117214,
+        "cleaning_version": CLEANING_VERSION,
+        "sampling_config": {
+            "random_seed": RANDOM_SEED,
+            "max_per_product": MAX_PER_PRODUCT_SAMPLE,
+        },
+        "train_eval_split_config": {
+            "held_out_ratio": HELD_OUT_RATIO,
+            "random_seed": RANDOM_SEED,
+        },
+        "vectorizer_config": {
+            k: (list(v) if isinstance(v, tuple) else v)
+            for k, v in VECTORIZER_PARAMS.items()
+        },
+        "model_config": dict(NMF_PARAMS),
+        "topics_count": N_TOPICS,
+        "top_terms_count": TOP_TERMS_COUNT,
     }
+
+
+def test_verify_model_metadata_compatibility() -> None:
+    valid_meta = _build_valid_metadata()
+    expected_fp = "a" * 64
+
+    # Valid metadata passes
+    verify_model_metadata(valid_meta, expected_fingerprint=expected_fp, expected_dataset_count=117214)
+
+    # Changed fingerprint raises
+    with pytest.raises(ValueError, match="Source-data fingerprint mismatch"):
+        verify_model_metadata(valid_meta, expected_fingerprint="b" * 64, expected_dataset_count=117214)
+
+    # Changed record count raises
+    with pytest.raises(ValueError, match="Dataset record count mismatch"):
+        verify_model_metadata(valid_meta, expected_fingerprint=expected_fp, expected_dataset_count=50000)
+
+    # Changed cleaning version raises
+    bad_clean = dict(valid_meta)
+    bad_clean["cleaning_version"] = "v0.9"
+    with pytest.raises(ValueError, match="Cleaning version mismatch"):
+        verify_model_metadata(bad_clean, expected_fingerprint=expected_fp, expected_dataset_count=117214)
+
+    # Changed sampling config raises
+    bad_sample = dict(valid_meta)
+    bad_sample["sampling_config"] = {"random_seed": 999, "max_per_product": 100}
+    with pytest.raises(ValueError, match="Sampling configuration mismatch"):
+        verify_model_metadata(bad_sample, expected_fingerprint=expected_fp, expected_dataset_count=117214)
+
+    # Changed vectorizer config raises
+    bad_vec = dict(valid_meta)
+    bad_vec["vectorizer_config"] = {"max_features": 500}
+    with pytest.raises(ValueError, match="Vectorizer configuration mismatch"):
+        verify_model_metadata(bad_vec, expected_fingerprint=expected_fp, expected_dataset_count=117214)
+
+    # Changed NMF config raises
+    bad_nmf = dict(valid_meta)
+    bad_nmf["model_config"] = {"n_components": 5}
+    with pytest.raises(ValueError, match="NMF model configuration mismatch"):
+        verify_model_metadata(bad_nmf, expected_fingerprint=expected_fp, expected_dataset_count=117214)
+
+
+def test_load_model_artifacts_file_handling(tmp_path: Path) -> None:
+    valid_meta = _build_valid_metadata()
+    expected_fp = "a" * 64
+
+    # Missing files raises FileNotFoundError
+    with pytest.raises(FileNotFoundError):
+        load_model_artifacts(tmp_path, expected_fingerprint=expected_fp)
+
+    # Incompatible metadata raises ValueError
     meta_path = tmp_path / "model_metadata.json"
-    meta_path.write_text(json.dumps(incompatible_meta), encoding="utf-8")
+    meta_path.write_text(json.dumps({"dataset_record_count": 10}), encoding="utf-8")
     (tmp_path / "vectorizer.joblib").write_text("dummy")
     (tmp_path / "topic_model.joblib").write_text("dummy")
 
-    with pytest.raises(ValueError, match="dataset count mismatch"):
-        load_model_artifacts(tmp_path, expected_dataset_count=117214)
+    with pytest.raises(ValueError, match="Source-data fingerprint mismatch"):
+        load_model_artifacts(tmp_path, expected_fingerprint=expected_fp)
+
+
+def test_in_memory_validation_rules() -> None:
+    # 1. Mismatched total records
+    complaints = [{"complaint_id": 1, "product": "Mortgage"}]
+    catalog = [{"topic_id": i, "top_terms": ["term"]} for i in range(10)]
+    topics = [{"complaint_id": 1, "topic_id": 0, "topic_strength": 0.8, "usable_for_nlp": True}]
+    metrics = {"nmf_converged": True, "topic_diversity": 0.9}
+
+    # Fails record count requirement (117,214)
+    with pytest.raises(ValueError, match="Source complaints count mismatch"):
+        validate_in_memory_results(complaints, catalog, topics, metrics)
+
+
+def test_load_and_validate_topic_results_rollback_on_failure(tmp_path: Path) -> None:
+    # Test transactional rollback behavior
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Create dummy schema file
+    dummy_schema = tmp_path / "schema.sql"
+    dummy_schema.write_text("SELECT 1;", encoding="utf-8")
+
+    topic_catalog = [{"topic_id": 0, "top_terms": ["a", "b"]}]
+    complaint_topics = [{"complaint_id": 1, "topic_id": 0, "topic_strength": 0.9, "usable_for_nlp": True}]
+
+    # Simulate error in SQL checks
+    mock_cur.execute.side_effect = Exception("Simulated DB validation failure")
+
+    with pytest.raises(Exception, match="Simulated DB validation failure"):
+        load_and_validate_topic_results_in_transaction(
+            conn=mock_conn,
+            topic_catalog=topic_catalog,
+            complaint_topics=complaint_topics,
+            expected_topic_counts={0: 1},
+            nlp_schema_path=dummy_schema,
+        )
+
+    # Rollback must be called, commit must NOT be called
+    mock_conn.rollback.assert_called_once()
+    mock_conn.commit.assert_not_called()
 
 
 def test_topic_issue_detail_denominators() -> None:
-    # Issue A: 100 complaints total
-    # Topic 0: 60 complaints (60%)
-    # Topic 1: 30 complaints (30%)
-    # Topic 2: 10 complaints (10%)
     synthetic_issue_totals = [("Issue A", 100)]
     synthetic_issue_topics = [
         ("Issue A", 0, 60),
@@ -210,23 +404,12 @@ def test_topic_issue_detail_denominators() -> None:
     assert res["top_three_topics"][0]["share_within_issue_pct"] == 60.0
     assert res["top_three_topics"][1]["share_within_issue_pct"] == 30.0
     assert res["top_three_topics"][2]["share_within_issue_pct"] == 10.0
-    # All 3 topics have >= 10% share
     assert res["topics_with_at_least_10pct_share"] == 3
 
 
-def test_reconstruction_similarity_computation() -> None:
-    # Identical matrices should have cosine similarity 1.0
-    X = sparse.csr_matrix([[1.0, 0.0, 2.0], [0.0, 1.0, 0.0]])
-    X_pred = np.array([[1.0, 0.0, 2.0], [0.0, 1.0, 0.0]])
-    sim = compute_reconstruction_similarity(X, X_pred)
-    assert pytest.approx(sim, abs=1e-5) == 1.0
-
-
 def test_topic_diversity_computation() -> None:
-    # 2 topics, 3 terms each. If all 6 terms distinct -> 1.0
     terms_distinct = [["a", "b", "c"], ["d", "e", "f"]]
     assert compute_topic_diversity(terms_distinct) == 1.0
 
-    # If 3 terms overlap -> 3 distinct out of 6 -> 0.5
     terms_overlap = [["a", "b", "c"], ["a", "b", "c"]]
     assert compute_topic_diversity(terms_overlap) == 0.5

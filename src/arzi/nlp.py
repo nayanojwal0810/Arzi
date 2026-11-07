@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import random
@@ -23,6 +24,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from arzi.analysis import EXPECTED_RECORD_COUNT
 from arzi.database import TARGET_DB, apply_schema, get_connection
 
+CLEANING_VERSION = "v1.0"
 RANDOM_SEED = 42
 N_TOPICS = 10
 TOP_TERMS_COUNT = 12
@@ -74,6 +76,32 @@ def is_usable_narrative(cleaned_text: str) -> bool:
     if not cleaned_text:
         return False
     return bool(RE_TOKEN.search(cleaned_text))
+
+
+def compute_source_fingerprint(complaints: list[dict[str, Any]]) -> str:
+    """Calculate deterministic SHA-256 fingerprint over source complaint records ordered by complaint_id."""
+    hasher = hashlib.sha256()
+    sorted_records = sorted(complaints, key=lambda r: int(r["complaint_id"]))
+
+    for r in sorted_records:
+        cid_str = str(r["complaint_id"])
+        prod_str = str(r.get("product") or "")
+        iss_str = str(r.get("issue") or "")
+        dt_val = r.get("date_received")
+        dt_str = dt_val.isoformat() if hasattr(dt_val, "isoformat") else str(dt_val or "")
+        narr_str = str(r.get("consumer_complaint_narrative") or "")
+
+        # Unambiguous length-delimited serialization preventing field boundary collisions
+        record_bytes = (
+            f"{len(cid_str)}:{cid_str}|"
+            f"{len(prod_str.encode('utf-8'))}:{prod_str}|"
+            f"{len(iss_str.encode('utf-8'))}:{iss_str}|"
+            f"{len(dt_str)}:{dt_str}|"
+            f"{len(narr_str.encode('utf-8'))}:{narr_str}\n"
+        ).encode("utf-8")
+        hasher.update(record_bytes)
+
+    return hasher.hexdigest()
 
 
 def sample_unique_narratives(
@@ -136,17 +164,30 @@ def split_train_eval(
 def compute_reconstruction_similarity(
     X_true: sparse.csr_matrix,
     X_pred: np.ndarray,
-) -> float:
-    """Compute mean row-wise cosine similarity between true TF-IDF matrix and reconstructed approximation."""
+) -> tuple[float, int, int]:
+    """Compute mean row-wise cosine similarity across all held-out documents.
+
+    If true norm or reconstructed norm is zero, similarity is 0.0.
+    Returns (mean_similarity, total_held_out, zero_vector_count).
+    """
+    n_docs = X_true.shape[0]
+    if n_docs == 0:
+        return 0.0, 0, 0
+
     dot_products = np.asarray(X_true.multiply(X_pred).sum(axis=1)).ravel()
     true_norms = np.sqrt(np.asarray(X_true.power(2).sum(axis=1)).ravel())
     pred_norms = np.linalg.norm(X_pred, axis=1)
 
     denom = true_norms * pred_norms
     valid = denom > 0
-    if not np.any(valid):
-        return 0.0
-    return float(np.mean(dot_products[valid] / denom[valid]))
+
+    sims = np.zeros(n_docs, dtype=float)
+    sims[valid] = dot_products[valid] / denom[valid]
+
+    zero_vector_count = int(np.sum(~valid))
+    mean_sim = float(np.mean(sims))
+
+    return round(mean_sim, 4), n_docs, zero_vector_count
 
 
 def compute_topic_diversity(topic_terms: list[list[str]]) -> float:
@@ -172,12 +213,14 @@ def fit_and_evaluate_topic_model(
     nmf_eval = NMF(**NMF_PARAMS)
     W_train = nmf_eval.fit_transform(X_train)
 
-    # 2. Evaluate on held-out narratives
+    # 2. Evaluate on held-out narratives (with zero-vector handling)
     X_eval = vec_eval.transform(eval_texts)
     W_eval = nmf_eval.transform(X_eval)
     X_eval_pred = W_eval @ nmf_eval.components_
 
-    mean_recon_sim = compute_reconstruction_similarity(X_eval, X_eval_pred)
+    mean_recon_sim, total_eval_docs, zero_vector_count = compute_reconstruction_similarity(
+        X_eval, X_eval_pred
+    )
 
     # 3. Refit final vectorizer and NMF model on complete fitting sample
     vec_final = TfidfVectorizer(**VECTORIZER_PARAMS)
@@ -199,10 +242,12 @@ def fit_and_evaluate_topic_model(
         "fit_sample_size": len(sample_texts),
         "train_size": len(train_texts),
         "held_out_eval_size": len(eval_texts),
+        "total_held_out_documents": total_eval_docs,
+        "held_out_zero_vector_count": zero_vector_count,
         "vocabulary_size": len(feature_names),
         "nmf_converged": bool(nmf_final.n_iter_ < NMF_PARAMS["max_iter"]),
         "nmf_iterations": int(nmf_final.n_iter_),
-        "held_out_reconstruction_similarity": round(mean_recon_sim, 4),
+        "held_out_reconstruction_similarity": mean_recon_sim,
         "topic_diversity": topic_div,
         "top_terms_by_topic": top_terms_by_topic,
     }
@@ -263,24 +308,232 @@ def assign_topics_to_complaints(
     return assignments
 
 
-def load_topic_results_to_db(
+def validate_in_memory_results(
+    complaints: list[dict[str, Any]],
     topic_catalog: list[dict[str, Any]],
     complaint_topics: list[dict[str, Any]],
-    nlp_schema_path: Path | str,
+    eval_metrics: dict[str, Any],
 ) -> None:
-    """Load topic catalog and complaint topic assignments in a single controlled database transaction."""
+    """Validate NLP dataset integrity and consistency in-memory before database modification."""
+    errors: list[str] = []
+
+    total_complaints = len(complaints)
+    if total_complaints != EXPECTED_RECORD_COUNT:
+        errors.append(f"Source complaints count mismatch: {total_complaints:,} != {EXPECTED_RECORD_COUNT:,}")
+
+    distinct_source_ids = len(set(r["complaint_id"] for r in complaints))
+    if distinct_source_ids != EXPECTED_RECORD_COUNT:
+        errors.append(f"Distinct source ID mismatch: {distinct_source_ids:,} != {EXPECTED_RECORD_COUNT:,}")
+
+    total_assignments = len(complaint_topics)
+    if total_assignments != EXPECTED_RECORD_COUNT:
+        errors.append(f"Assignment table row mismatch: {total_assignments:,} != {EXPECTED_RECORD_COUNT:,}")
+
+    assignment_ids = set(r["complaint_id"] for r in complaint_topics)
+    if len(assignment_ids) != EXPECTED_RECORD_COUNT:
+        errors.append(f"Distinct assignment complaint ID mismatch: {len(assignment_ids):,} != {EXPECTED_RECORD_COUNT:,}")
+
+    source_ids = set(r["complaint_id"] for r in complaints)
+    orphans = assignment_ids - source_ids
+    if orphans:
+        errors.append(f"Found {len(orphans)} orphan complaint IDs in topic assignments")
+
+    if len(topic_catalog) != N_TOPICS:
+        errors.append(f"Expected {N_TOPICS} topic catalog entries, got {len(topic_catalog)}")
+
+    assigned = [r for r in complaint_topics if r["topic_id"] is not None]
+    unassigned = [r for r in complaint_topics if r["topic_id"] is None]
+
+    if (len(assigned) + len(unassigned)) != total_complaints:
+        errors.append(
+            f"Assigned ({len(assigned):,}) + unassigned ({len(unassigned):,}) != total ({total_complaints:,})"
+        )
+
+    for r in assigned:
+        tid = r["topic_id"]
+        strn = r["topic_strength"]
+        if not (0 <= tid < N_TOPICS):
+            errors.append(f"Invalid topic ID {tid} for complaint {r['complaint_id']}")
+        if strn is None or not (0.0 <= strn <= 1.0):
+            errors.append(f"Invalid topic strength {strn} for complaint {r['complaint_id']}")
+        if not r["usable_for_nlp"]:
+            errors.append(f"Assigned complaint {r['complaint_id']} marked as not usable for NLP")
+
+    for r in unassigned:
+        if r["topic_strength"] is not None:
+            errors.append(f"Unassigned complaint {r['complaint_id']} has non-null topic strength")
+        if r["usable_for_nlp"]:
+            errors.append(f"Unassigned complaint {r['complaint_id']} marked as usable for NLP")
+
+    if not eval_metrics.get("nmf_converged"):
+        errors.append("NMF model failed to converge within maximum iterations")
+
+    topic_div = eval_metrics.get("topic_diversity", 0.0)
+    if not (0.0 < topic_div <= 1.0):
+        errors.append(f"Invalid topic diversity value: {topic_div}")
+
+    topic_counts = Counter(r["topic_id"] for r in assigned)
+    if assigned:
+        for tid, cnt in topic_counts.items():
+            share = (cnt / len(assigned)) * 100.0
+            if share > 80.0:
+                errors.append(f"Topic {tid} dominates assignments with {share:.1f}% (> 80%)")
+
+    if errors:
+        raise ValueError("In-memory NLP validation failed:\n" + "\n".join(f"  - {e}" for e in errors))
+
+
+# Alias for backward compatibility
+validate_nlp_results = validate_in_memory_results
+
+
+def run_in_transaction_sql_checks(
+    cur: Any,
+    expected_assigned_count: int,
+    expected_unassigned_count: int,
+    expected_topic_counts: dict[int, int],
+) -> dict[str, Any]:
+    """Execute required database validation queries inside the active transaction before commit."""
+    # 1. Source complaints count and distinct IDs
+    cur.execute("SELECT COUNT(*), COUNT(DISTINCT complaint_id) FROM arzi.complaints;")
+    src_cnt, src_dist = cur.fetchone()
+    if src_cnt != EXPECTED_RECORD_COUNT or src_dist != EXPECTED_RECORD_COUNT:
+        raise ValueError(f"Source complaints integrity mismatch: count={src_cnt}, distinct={src_dist}")
+
+    # 2. NLP assignment records count and distinct IDs
+    cur.execute("SELECT COUNT(*), COUNT(DISTINCT complaint_id) FROM arzi.complaint_topics;")
+    asgn_cnt, asgn_dist = cur.fetchone()
+    if asgn_cnt != EXPECTED_RECORD_COUNT or asgn_dist != EXPECTED_RECORD_COUNT:
+        raise ValueError(f"Assignment records integrity mismatch: count={asgn_cnt}, distinct={asgn_dist}")
+
+    # 3. Check 1-to-1 matching and orphans
+    cur.execute(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE ct.complaint_id IS NULL) AS missing_in_topics,
+            COUNT(*) FILTER (WHERE c.complaint_id IS NULL) AS orphan_in_topics
+        FROM arzi.complaints c
+        FULL OUTER JOIN arzi.complaint_topics ct ON c.complaint_id = ct.complaint_id;
+        """
+    )
+    missing, orphans = cur.fetchone()
+    if missing != 0:
+        raise ValueError(f"Found {missing} source complaint IDs missing from topic assignments")
+    if orphans != 0:
+        raise ValueError(f"Found {orphans} orphan complaint IDs in topic assignments")
+
+    # 4. Exactly 10 topic catalog rows
+    cur.execute("SELECT COUNT(*) FROM arzi.topic_catalog;")
+    cat_cnt = cur.fetchone()[0]
+    if cat_cnt != N_TOPICS:
+        raise ValueError(f"Expected {N_TOPICS} topic catalog rows, got {cat_cnt}")
+
+    # 5. Assigned topic IDs valid (0-9) and reference catalog
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM arzi.complaint_topics ct
+        WHERE ct.topic_id IS NOT NULL AND (
+            ct.topic_id < 0 OR ct.topic_id >= 10 OR NOT EXISTS (
+                SELECT 1 FROM arzi.topic_catalog tc WHERE tc.topic_id = ct.topic_id
+            )
+        );
+        """
+    )
+    invalid_topics = cur.fetchone()[0]
+    if invalid_topics != 0:
+        raise ValueError(f"Found {invalid_topics} assignments with invalid topic IDs or missing catalog reference")
+
+    # 6. Valid strengths and unassigned conditions
+    cur.execute(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE topic_id IS NOT NULL AND (topic_strength IS NULL OR topic_strength < 0.0 OR topic_strength > 1.0)),
+            COUNT(*) FILTER (WHERE topic_id IS NULL AND (topic_strength IS NOT NULL OR usable_for_nlp = TRUE)),
+            COUNT(*) FILTER (WHERE topic_id IS NOT NULL),
+            COUNT(*) FILTER (WHERE topic_id IS NULL)
+        FROM arzi.complaint_topics;
+        """
+    )
+    bad_assigned_str, bad_unassigned, db_assigned, db_unassigned = cur.fetchone()
+    if bad_assigned_str != 0:
+        raise ValueError(f"Found {bad_assigned_str} assigned records with invalid topic strength")
+    if bad_unassigned != 0:
+        raise ValueError(f"Found {bad_unassigned} unassigned records with non-null strength or marked usable")
+    if db_assigned != expected_assigned_count:
+        raise ValueError(f"Assigned count mismatch: expected {expected_assigned_count}, got {db_assigned}")
+    if db_unassigned != expected_unassigned_count:
+        raise ValueError(f"Unassigned count mismatch: expected {expected_unassigned_count}, got {db_unassigned}")
+    if (db_assigned + db_unassigned) != EXPECTED_RECORD_COUNT:
+        raise ValueError(f"Total count mismatch: {db_assigned} + {db_unassigned} != {EXPECTED_RECORD_COUNT}")
+
+    # 7. View counts reconcile to assigned count
+    cur.execute("SELECT COALESCE(SUM(complaint_count), 0) FROM arzi.v_topic_summary;")
+    v_topic_sum = cur.fetchone()[0]
+    if v_topic_sum != db_assigned:
+        raise ValueError(f"v_topic_summary sum ({v_topic_sum}) != assigned count ({db_assigned})")
+
+    cur.execute("SELECT COALESCE(SUM(complaint_count), 0) FROM arzi.v_topic_product_summary;")
+    v_prod_sum = cur.fetchone()[0]
+    if v_prod_sum != db_assigned:
+        raise ValueError(f"v_topic_product_summary sum ({v_prod_sum}) != assigned count ({db_assigned})")
+
+    cur.execute("SELECT COALESCE(SUM(complaint_count), 0) FROM arzi.v_topic_issue_summary;")
+    v_issue_sum = cur.fetchone()[0]
+    if v_issue_sum != db_assigned:
+        raise ValueError(f"v_topic_issue_summary sum ({v_issue_sum}) != assigned count ({db_assigned})")
+
+    # 8. Compare database per-topic counts with in-memory counts
+    cur.execute(
+        """
+        SELECT topic_id, COUNT(*)
+        FROM arzi.complaint_topics
+        WHERE topic_id IS NOT NULL
+        GROUP BY topic_id
+        ORDER BY topic_id ASC;
+        """
+    )
+    db_topic_counts = dict(cur.fetchall())
+    for tid in range(N_TOPICS):
+        expected_cnt = expected_topic_counts.get(tid, 0)
+        actual_cnt = db_topic_counts.get(tid, 0)
+        if actual_cnt != expected_cnt:
+            raise ValueError(f"Topic {tid} count mismatch: expected {expected_cnt}, got {actual_cnt}")
+
+    return {
+        "source_complaints": src_cnt,
+        "assignment_records": asgn_cnt,
+        "assigned_count": db_assigned,
+        "unassigned_count": db_unassigned,
+        "topic_catalog_rows": cat_cnt,
+        "views_reconciled": True,
+        "per_topic_counts_matched": True,
+    }
+
+
+def load_and_validate_topic_results_in_transaction(
+    conn: Any,
+    topic_catalog: list[dict[str, Any]],
+    complaint_topics: list[dict[str, Any]],
+    expected_topic_counts: dict[int, int],
+    nlp_schema_path: Path | str,
+) -> dict[str, Any]:
+    """Replace topic catalog and assignments and validate SQL integrity inside a single transaction."""
     schema_path = Path(nlp_schema_path)
 
-    with get_connection(dbname=TARGET_DB) as conn:
+    expected_assigned = sum(1 for r in complaint_topics if r["topic_id"] is not None)
+    expected_unassigned = len(complaint_topics) - expected_assigned
+
+    try:
         with conn.cursor() as cur:
-            # 1. Apply schema and views safely
+            # 1. Apply schema and view definitions safely
             apply_schema(conn, schema_path)
 
-            # 2. Safely clear project-owned topic tables for repeatable rerun
+            # 2. Replace topic catalog and assignments within the transaction
             cur.execute("TRUNCATE TABLE arzi.complaint_topics;")
             cur.execute("DELETE FROM arzi.topic_catalog;")
 
-            # 3. Insert topic catalog entries
+            # Insert topic catalog
             for row in topic_catalog:
                 cur.execute(
                     """
@@ -290,7 +543,7 @@ def load_topic_results_to_db(
                     (row["topic_id"], row["top_terms"]),
                 )
 
-            # 4. Bulk COPY complaint topic assignments
+            # Bulk COPY complaint topics
             buffer = io.StringIO()
             for r in complaint_topics:
                 tid_str = str(r["topic_id"]) if r["topic_id"] is not None else "\\N"
@@ -311,7 +564,35 @@ def load_topic_results_to_db(
                 while chunk := buffer.read(65536):
                     copy.write(chunk)
 
+            # 3. Execute in-transaction SQL validation checks BEFORE commit
+            db_metrics = run_in_transaction_sql_checks(
+                cur,
+                expected_assigned_count=expected_assigned,
+                expected_unassigned_count=expected_unassigned,
+                expected_topic_counts=expected_topic_counts,
+            )
+
+        # 4. Commit ONLY after every check succeeds
         conn.commit()
+        return db_metrics
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def load_topic_results_to_db(
+    topic_catalog: list[dict[str, Any]],
+    complaint_topics: list[dict[str, Any]],
+    nlp_schema_path: Path | str,
+) -> dict[str, Any]:
+    """Execute transactional load and validation with a newly acquired database connection."""
+    expected_counts = Counter(
+        r["topic_id"] for r in complaint_topics if r["topic_id"] is not None
+    )
+    with get_connection(dbname=TARGET_DB) as conn:
+        return load_and_validate_topic_results_in_transaction(
+            conn, topic_catalog, complaint_topics, expected_counts, nlp_schema_path
+        )
 
 
 def fetch_topic_summary() -> list[dict[str, Any]]:
@@ -452,85 +733,6 @@ def analyze_topic_issue_detail(
     return results
 
 
-def validate_nlp_results(
-    complaints: list[dict[str, Any]],
-    topic_catalog: list[dict[str, Any]],
-    complaint_topics: list[dict[str, Any]],
-    eval_metrics: dict[str, Any],
-) -> None:
-    """Validate NLP dataset integrity, topic consistency, and model requirements against acceptance rules."""
-    errors: list[str] = []
-
-    # 1. Dataset integrity
-    total_complaints = len(complaints)
-    if total_complaints != EXPECTED_RECORD_COUNT:
-        errors.append(f"Source complaints count mismatch: {total_complaints:,} != {EXPECTED_RECORD_COUNT:,}")
-
-    distinct_source_ids = len(set(r["complaint_id"] for r in complaints))
-    if distinct_source_ids != EXPECTED_RECORD_COUNT:
-        errors.append(f"Distinct source ID mismatch: {distinct_source_ids:,} != {EXPECTED_RECORD_COUNT:,}")
-
-    total_assignments = len(complaint_topics)
-    if total_assignments != EXPECTED_RECORD_COUNT:
-        errors.append(f"Assignment table row mismatch: {total_assignments:,} != {EXPECTED_RECORD_COUNT:,}")
-
-    assignment_ids = set(r["complaint_id"] for r in complaint_topics)
-    if len(assignment_ids) != EXPECTED_RECORD_COUNT:
-        errors.append(f"Distinct assignment complaint ID mismatch: {len(assignment_ids):,} != {EXPECTED_RECORD_COUNT:,}")
-
-    source_ids = set(r["complaint_id"] for r in complaints)
-    orphans = assignment_ids - source_ids
-    if orphans:
-        errors.append(f"Found {len(orphans)} orphan complaint IDs in topic assignments")
-
-    if len(topic_catalog) != N_TOPICS:
-        errors.append(f"Expected {N_TOPICS} topic catalog entries, got {len(topic_catalog)}")
-
-    # 2. Topic assignment consistency
-    assigned = [r for r in complaint_topics if r["topic_id"] is not None]
-    unassigned = [r for r in complaint_topics if r["topic_id"] is None]
-
-    if (len(assigned) + len(unassigned)) != total_complaints:
-        errors.append(
-            f"Assigned ({len(assigned):,}) + unassigned ({len(unassigned):,}) != total ({total_complaints:,})"
-        )
-
-    for r in assigned:
-        tid = r["topic_id"]
-        strn = r["topic_strength"]
-        if not (0 <= tid < N_TOPICS):
-            errors.append(f"Invalid topic ID {tid} for complaint {r['complaint_id']}")
-        if strn is None or not (0.0 <= strn <= 1.0):
-            errors.append(f"Invalid topic strength {strn} for complaint {r['complaint_id']}")
-        if not r["usable_for_nlp"]:
-            errors.append(f"Assigned complaint {r['complaint_id']} marked as not usable for NLP")
-
-    for r in unassigned:
-        if r["topic_strength"] is not None:
-            errors.append(f"Unassigned complaint {r['complaint_id']} has non-null topic strength")
-        if r["usable_for_nlp"]:
-            errors.append(f"Unassigned complaint {r['complaint_id']} marked as usable for NLP")
-
-    # 3. Model convergence and diversity
-    if not eval_metrics.get("nmf_converged"):
-        errors.append("NMF model failed to converge within maximum iterations")
-
-    topic_div = eval_metrics.get("topic_diversity", 0.0)
-    if not (0.0 < topic_div <= 1.0):
-        errors.append(f"Invalid topic diversity value: {topic_div}")
-
-    # Dominance check: no single topic should claim > 80% of all assigned complaints
-    topic_counts = Counter(r["topic_id"] for r in assigned)
-    if assigned:
-        for tid, cnt in topic_counts.items():
-            share = (cnt / len(assigned)) * 100.0
-            if share > 80.0:
-                errors.append(f"Topic {tid} dominates assignments with {share:.1f}% (> 80%)")
-
-    if errors:
-        raise ValueError("NLP quality checks failed:\n" + "\n".join(f"  - {e}" for e in errors))
-
-
 def generate_nlp_charts(
     topic_summary_rows: list[dict[str, Any]],
     topic_product_rows: list[dict[str, Any]],
@@ -544,9 +746,7 @@ def generate_nlp_charts(
 
     terms_by_topic = {r["topic_id"]: r["top_terms"] for r in topic_catalog}
 
-    # -------------------------------------------------------------------------
     # Chart A: topic_distribution.png
-    # -------------------------------------------------------------------------
     chart_a_path = out_dir / "topic_distribution.png"
     sorted_topics = sorted(topic_summary_rows, key=lambda x: x["complaint_count"], reverse=True)
 
@@ -565,7 +765,7 @@ def generate_nlp_charts(
     bars = ax.barh(y_pos, counts, color="#2b5c8f", edgecolor="black", alpha=0.85, height=0.65)
     ax.set_yticks(y_pos)
     ax.set_yticklabels(topic_labels, fontsize=8.5)
-    ax.invert_yaxis()  # Highest volume on top
+    ax.invert_yaxis()
     ax.set_xlabel("Assigned Complaint Count", fontsize=10)
     title_text = "Learned NLP Topic Distribution Across Financial Complaints"
     if unassigned_count > 0:
@@ -589,9 +789,7 @@ def generate_nlp_charts(
     fig.savefig(chart_a_path, dpi=150)
     plt.close(fig)
 
-    # -------------------------------------------------------------------------
     # Chart B: topic_product_heatmap.png
-    # -------------------------------------------------------------------------
     chart_b_path = out_dir / "topic_product_heatmap.png"
     all_products = sorted(set(r["product"] for r in topic_product_rows))
     product_idx = {p: i for i, p in enumerate(all_products)}
@@ -611,7 +809,6 @@ def generate_nlp_charts(
     ax.set_xticklabels([f"T{i}" for i in range(N_TOPICS)], fontsize=9)
     ax.set_xlabel("Learned Topic ID", fontsize=10, labelpad=8)
 
-    # Wrap long product names
     short_prods = [
         re.sub(r",?\s+", " ", p).replace("Credit reporting, credit repair services, or other personal consumer reports", "Credit reporting & repair")
         .replace("Money transfer, virtual currency, or money service", "Money transfer & currency")
@@ -624,7 +821,6 @@ def generate_nlp_charts(
     cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.03)
     cbar.set_label("Within-Product Complaint Share (%)", fontsize=9.5)
 
-    # Annotate cell values
     for i in range(len(all_products)):
         for j in range(N_TOPICS):
             val = matrix[i, j]
@@ -643,6 +839,98 @@ def generate_nlp_charts(
     return chart_a_path, chart_b_path
 
 
+def verify_model_metadata(
+    metadata: dict[str, Any],
+    expected_fingerprint: str,
+    expected_dataset_count: int = EXPECTED_RECORD_COUNT,
+) -> None:
+    """Verify that saved model metadata strictly matches the source dataset and model configuration."""
+    if not isinstance(metadata, dict):
+        raise ValueError("Model metadata must be a dictionary")
+
+    # 1. Source fingerprint
+    actual_fp = metadata.get("source_data_fingerprint")
+    if actual_fp != expected_fingerprint:
+        raise ValueError(
+            f"Source-data fingerprint mismatch: expected {expected_fingerprint}, got {actual_fp}. "
+            f"Use --retrain to rebuild model for current data."
+        )
+
+    # 2. Dataset record count
+    actual_cnt = metadata.get("dataset_record_count")
+    if actual_cnt != expected_dataset_count:
+        raise ValueError(
+            f"Dataset record count mismatch: expected {expected_dataset_count:,}, got {actual_cnt}. "
+            f"Use --retrain to rebuild model."
+        )
+
+    # 3. Cleaning version
+    actual_clean = metadata.get("cleaning_version")
+    if actual_clean != CLEANING_VERSION:
+        raise ValueError(
+            f"Cleaning version mismatch: expected {CLEANING_VERSION}, got {actual_clean}. "
+            f"Use --retrain to rebuild model."
+        )
+
+    # 4. Sampling config
+    expected_sampling = {
+        "random_seed": RANDOM_SEED,
+        "max_per_product": MAX_PER_PRODUCT_SAMPLE,
+    }
+    actual_sampling = metadata.get("sampling_config")
+    if actual_sampling != expected_sampling:
+        raise ValueError(
+            f"Sampling configuration mismatch: expected {expected_sampling}, got {actual_sampling}. "
+            f"Use --retrain to rebuild model."
+        )
+
+    # 5. Train/eval split config
+    expected_split = {
+        "held_out_ratio": HELD_OUT_RATIO,
+        "random_seed": RANDOM_SEED,
+    }
+    actual_split = metadata.get("train_eval_split_config")
+    if actual_split != expected_split:
+        raise ValueError(
+            f"Train/eval split configuration mismatch: expected {expected_split}, got {actual_split}. "
+            f"Use --retrain to rebuild model."
+        )
+
+    # 6. Vectorizer config
+    expected_vec = {
+        k: (list(v) if isinstance(v, tuple) else v)
+        for k, v in VECTORIZER_PARAMS.items()
+    }
+    actual_vec = metadata.get("vectorizer_config")
+    if actual_vec != expected_vec:
+        raise ValueError(
+            f"Vectorizer configuration mismatch: expected {expected_vec}, got {actual_vec}. "
+            f"Use --retrain to rebuild model."
+        )
+
+    # 7. Model config
+    expected_model = dict(NMF_PARAMS)
+    actual_model = metadata.get("model_config")
+    if actual_model != expected_model:
+        raise ValueError(
+            f"NMF model configuration mismatch: expected {expected_model}, got {actual_model}. "
+            f"Use --retrain to rebuild model."
+        )
+
+    # 8. Topics count & top terms count
+    if metadata.get("topics_count") != N_TOPICS:
+        raise ValueError(
+            f"Topics count mismatch: expected {N_TOPICS}, got {metadata.get('topics_count')}. "
+            f"Use --retrain to rebuild model."
+        )
+
+    if metadata.get("top_terms_count") != TOP_TERMS_COUNT:
+        raise ValueError(
+            f"Top terms count mismatch: expected {TOP_TERMS_COUNT}, got {metadata.get('top_terms_count')}. "
+            f"Use --retrain to rebuild model."
+        )
+
+
 def save_model_artifacts(
     vectorizer: TfidfVectorizer,
     nmf_model: NMF,
@@ -657,11 +945,12 @@ def save_model_artifacts(
     joblib.dump(nmf_model, out_dir / "topic_model.joblib")
 
     meta_path = out_dir / "model_metadata.json"
-    meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    meta_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
 def load_model_artifacts(
     artifacts_dir: Path | str,
+    expected_fingerprint: str,
     expected_dataset_count: int = EXPECTED_RECORD_COUNT,
 ) -> tuple[TfidfVectorizer, NMF, dict[str, Any]]:
     """Load local trained artifacts and verify model configuration compatibility."""
@@ -675,18 +964,8 @@ def load_model_artifacts(
 
     metadata = json.loads(meta_path.read_text(encoding="utf-8"))
 
-    # Verify compatibility
-    if metadata.get("dataset_record_count") != expected_dataset_count:
-        raise ValueError(
-            f"Model metadata dataset count mismatch: expected {expected_dataset_count:,}, "
-            f"got {metadata.get('dataset_record_count')}"
-        )
-
-    if metadata.get("model_config", {}).get("n_components") != N_TOPICS:
-        raise ValueError(
-            f"Model metadata n_components mismatch: expected {N_TOPICS}, "
-            f"got {metadata.get('model_config', {}).get('n_components')}"
-        )
+    # Verify comprehensive metadata compatibility
+    verify_model_metadata(metadata, expected_fingerprint, expected_dataset_count)
 
     vectorizer: TfidfVectorizer = joblib.load(vec_path)
     nmf_model: NMF = joblib.load(model_path)

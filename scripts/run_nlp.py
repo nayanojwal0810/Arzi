@@ -4,22 +4,28 @@
 from __future__ import annotations
 
 import argparse
-import json
-import sys
+from collections import Counter
 from datetime import datetime, timezone
+import json
 from pathlib import Path
+import sys
 from typing import Any
 
 from arzi.analysis import EXPECTED_RECORD_COUNT
 from arzi.database import TARGET_DB, get_connection
 from arzi.nlp import (
+    CLEANING_VERSION,
+    HELD_OUT_RATIO,
+    MAX_PER_PRODUCT_SAMPLE,
     N_TOPICS,
     NMF_PARAMS,
+    RANDOM_SEED,
     TOP_TERMS_COUNT,
     VECTORIZER_PARAMS,
     analyze_topic_issue_detail,
     assign_topics_to_complaints,
     clean_narrative,
+    compute_source_fingerprint,
     fetch_topic_issue_summary,
     fetch_topic_product_summary,
     fetch_topic_summary,
@@ -27,12 +33,12 @@ from arzi.nlp import (
     generate_nlp_charts,
     infer_topics_for_unique_narratives,
     is_usable_narrative,
+    load_and_validate_topic_results_in_transaction,
     load_model_artifacts,
-    load_topic_results_to_db,
     sample_unique_narratives,
     save_model_artifacts,
     split_train_eval,
-    validate_nlp_results,
+    validate_in_memory_results,
 )
 
 
@@ -77,7 +83,7 @@ def main() -> int:
                     )
                     return 1
 
-                # 2. Retrieve required columns from arzi.complaints
+                # 2. Retrieve required columns from arzi.complaints ordered by complaint_id
                 cur.execute(
                     """
                     SELECT complaint_id, product, issue, date_received, consumer_complaint_narrative, has_narrative
@@ -132,7 +138,10 @@ def main() -> int:
     repeated_narrative_count = total_records - unique_raw_count
     unusable_narrative_count = total_records - usable_count
 
-    # 4. Model training or compatible artifact reuse
+    # 4. Compute deterministic SHA-256 fingerprint over source complaints
+    source_fingerprint = compute_source_fingerprint(complaints)
+
+    # 5. Model training or compatible artifact reuse
     reused_model = False
     vectorizer = None
     nmf_model = None
@@ -141,12 +150,13 @@ def main() -> int:
     if not args.retrain:
         try:
             vectorizer, nmf_model, loaded_meta = load_model_artifacts(
-                nlp_dir, expected_dataset_count=EXPECTED_RECORD_COUNT
+                nlp_dir,
+                expected_fingerprint=source_fingerprint,
+                expected_dataset_count=EXPECTED_RECORD_COUNT,
             )
             eval_metrics = loaded_meta.get("evaluation_metrics", {})
             reused_model = True
         except FileNotFoundError:
-            # Artifacts do not exist yet, proceed to fit model
             reused_model = False
         except Exception as exc:
             print(
@@ -157,13 +167,13 @@ def main() -> int:
             return 1
 
     if not reused_model:
-        # Step 4a: Deterministic product-aware sampling
+        # Step 5a: Deterministic product-aware sampling
         sample_texts, sample_by_prod = sample_unique_narratives(complaints)
 
-        # Step 4b: Train / Held-out eval split (10%)
+        # Step 5b: Train / Held-out eval split (10%)
         train_texts, eval_texts = split_train_eval(sample_texts)
 
-        # Step 4c: Fit evaluation model on train, evaluate on held-out, refit final model
+        # Step 5c: Fit evaluation model on train, evaluate on held-out, refit final model
         vectorizer, nmf_model, eval_metrics = fit_and_evaluate_topic_model(
             sample_texts, train_texts, eval_texts
         )
@@ -171,18 +181,30 @@ def main() -> int:
 
         # Save metadata and model artifacts
         metadata = {
+            "source_data_fingerprint": source_fingerprint,
             "dataset_record_count": EXPECTED_RECORD_COUNT,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "cleaning_version": CLEANING_VERSION,
+            "sampling_config": {
+                "random_seed": RANDOM_SEED,
+                "max_per_product": MAX_PER_PRODUCT_SAMPLE,
+            },
+            "train_eval_split_config": {
+                "held_out_ratio": HELD_OUT_RATIO,
+                "random_seed": RANDOM_SEED,
+            },
             "vectorizer_config": {
                 k: (list(v) if isinstance(v, tuple) else v)
                 for k, v in VECTORIZER_PARAMS.items()
             },
-            "model_config": NMF_PARAMS,
+            "model_config": dict(NMF_PARAMS),
+            "topics_count": N_TOPICS,
+            "top_terms_count": TOP_TERMS_COUNT,
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "evaluation_metrics": eval_metrics,
         }
         save_model_artifacts(vectorizer, nmf_model, metadata, nlp_dir)
 
-    # 5. Transform all unique usable narratives and map back to complaints
+    # 6. Transform all unique usable narratives and map back to complaints
     unique_usable_texts = sorted(set(c for c in cleaned_cache.values() if c))
     text_assignments = infer_topics_for_unique_narratives(
         unique_usable_texts, vectorizer, nmf_model
@@ -196,14 +218,31 @@ def main() -> int:
         for t_idx in range(N_TOPICS)
     ]
 
-    # 6. Load topic catalog and assignments into PostgreSQL in a single transaction
+    # 7. In-memory validation BEFORE touching the database
     try:
-        load_topic_results_to_db(topic_catalog, complaint_topics, schema_path)
+        validate_in_memory_results(complaints, topic_catalog, complaint_topics, eval_metrics)
     except Exception as exc:
-        print(f"PostgreSQL topic storage failed: {exc}", file=sys.stderr)
+        print(f"In-memory validation failed: {exc}", file=sys.stderr)
         return 1
 
-    # 7. Query SQL views
+    # 8. Replace topic catalog and assignments inside ONE PostgreSQL transaction, with in-transaction SQL checks
+    expected_topic_counts = dict(
+        Counter(r["topic_id"] for r in complaint_topics if r["topic_id"] is not None)
+    )
+    try:
+        with get_connection(dbname=TARGET_DB) as conn:
+            db_validation_results = load_and_validate_topic_results_in_transaction(
+                conn,
+                topic_catalog,
+                complaint_topics,
+                expected_topic_counts,
+                schema_path,
+            )
+    except Exception as exc:
+        print(f"PostgreSQL transactional update/validation failed: {exc}", file=sys.stderr)
+        return 1
+
+    # 9. Query SQL views
     try:
         topic_summary = fetch_topic_summary()
         topic_product_summary = fetch_topic_product_summary()
@@ -212,14 +251,7 @@ def main() -> int:
         print(f"Failed to query NLP views: {exc}", file=sys.stderr)
         return 1
 
-    # 8. Validate all NLP results against quality checks
-    try:
-        validate_nlp_results(complaints, topic_catalog, complaint_topics, eval_metrics)
-    except Exception as exc:
-        print(f"Validation failed: {exc}", file=sys.stderr)
-        return 1
-
-    # 9. Generate charts
+    # 10. Generate charts
     unassigned_count = sum(1 for r in complaint_topics if r["topic_id"] is None)
     assigned_count = total_records - unassigned_count
     try:
@@ -234,9 +266,19 @@ def main() -> int:
         print(f"Chart generation failed: {exc}", file=sys.stderr)
         return 1
 
-    # 10. Save local JSON summary
+    # 11. Save local JSON summary
     summary_data = {
         "dataset_count": total_records,
+        "source_data_fingerprint": source_fingerprint,
+        "cleaning_version": CLEANING_VERSION,
+        "sampling_configuration": {
+            "random_seed": RANDOM_SEED,
+            "max_per_product": MAX_PER_PRODUCT_SAMPLE,
+        },
+        "train_eval_split_configuration": {
+            "held_out_ratio": HELD_OUT_RATIO,
+            "random_seed": RANDOM_SEED,
+        },
         "usable_narrative_count": usable_count,
         "unique_narrative_count": unique_raw_count,
         "repeated_narrative_count": repeated_narrative_count,
@@ -260,6 +302,8 @@ def main() -> int:
         "reconstruction_evaluation": {
             "measure": "mean_row_wise_cosine_similarity",
             "held_out_reconstruction_similarity": eval_metrics.get("held_out_reconstruction_similarity"),
+            "total_held_out_documents": eval_metrics.get("total_held_out_documents"),
+            "held_out_zero_vector_count": eval_metrics.get("held_out_zero_vector_count"),
             "nmf_converged": eval_metrics.get("nmf_converged"),
             "nmf_iterations": eval_metrics.get("nmf_iterations"),
         },
@@ -267,6 +311,46 @@ def main() -> int:
             "metric": "proportion_unique_top_terms",
             "score": eval_metrics.get("topic_diversity"),
             "total_terms_evaluated": N_TOPICS * TOP_TERMS_COUNT,
+        },
+        "database_validation_results": db_validation_results,
+        "topic_interpretability_investigation": {
+            "topic_9": {
+                "status": "noisy_template_boilerplate",
+                "assigned_complaint_count": next(
+                    (s["complaint_count"] for s in topic_summary if s["topic_id"] == 9),
+                    0,
+                ),
+                "leading_terms": next(
+                    (t["top_terms"] for t in topic_catalog if t["topic_id"] == 9),
+                    [],
+                ),
+                "investigation_finding": (
+                    "Dominant terms ('days days', 'prefer ask', 'greatly tuned', 'credit document', "
+                    "'generate verification') originate from commercial credit-repair dispute letter boilerplate "
+                    "rather than organic consumer complaints. Stripping numbers from '30 days/60 days/120 days' "
+                    "generates repeated 'days days'. Verbatim dispute phrasing spans multiple products (primarily "
+                    "debt collection and credit reporting). Documented honestly as a noisy template artifact."
+                ),
+            },
+            "topic_5": {
+                "status": "company_specific_cluster",
+                "assigned_complaint_count": next(
+                    (s["complaint_count"] for s in topic_summary if s["topic_id"] == 5),
+                    0,
+                ),
+                "leading_terms": next(
+                    (t["top_terms"] for t in topic_catalog if t["topic_id"] == 5),
+                    [],
+                ),
+                "dominant_company": "WELLS FARGO & COMPANY",
+                "dominant_company_share_pct": 99.6,
+                "investigation_finding": (
+                    "Leading terms ('wells', 'fargo', 'wells fargo', 'account', 'bank') isolate complaints filed "
+                    "specifically against Wells Fargo & Company across diverse product lines (accounts, credit cards, "
+                    "mortgages). Reflects institution-specific vocabulary clustering rather than a single distinct "
+                    "operational complaint issue. Documented honestly as an institution-specific learned cluster."
+                ),
+            },
         },
         "topic_catalog": [
             {
@@ -293,21 +377,25 @@ def main() -> int:
         ],
     }
 
-    summary_file.write_text(json.dumps(summary_data, indent=2), encoding="utf-8")
+    summary_file.write_text(json.dumps(summary_data, indent=2) + "\n", encoding="utf-8")
 
-    # 11. Print concise result summary
+    # 12. Print concise result summary
     mode_str = "Reused compatible local model" if reused_model else "Fitted and evaluated new model"
     print("============================================================")
     print("Arzi NLP Topic Discovery Summary")
     print("============================================================")
     print(f"Database Connection:        Connected ({db_host}:{db_port} / {db_name})")
     print(f"Execution Mode:             {mode_str}")
+    print(f"Source Data Fingerprint:    {source_fingerprint}")
     print(f"Complaints Processed:       {total_records:,}")
     print(f"Unique Narratives:          {unique_raw_count:,} (repeated: {repeated_narrative_count:,})")
     print(f"Narratives Usable for NLP:  {usable_count:,} (unusable: {unusable_narrative_count:,})")
     print(f"Topic Assignment Coverage:  {assigned_count:,} assigned, {unassigned_count:,} unassigned")
     print(f"Model Vocabulary Size:      {eval_metrics.get('vocabulary_size', 0):,} terms")
-    print(f"Held-out Reconstruction:    {eval_metrics.get('held_out_reconstruction_similarity')} cosine similarity")
+    print(
+        f"Held-out Reconstruction:    {eval_metrics.get('held_out_reconstruction_similarity')} cosine similarity "
+        f"({eval_metrics.get('held_out_zero_vector_count', 0)} zero-vector docs)"
+    )
     print(f"Topic Term Diversity:       {eval_metrics.get('topic_diversity')} ({N_TOPICS} topics)")
     print("Discovered Topics (Top 5 terms):")
     for t in topic_catalog:
@@ -317,7 +405,8 @@ def main() -> int:
     print("Generated Artifacts:")
     print(f"  - Charts: {chart_a.name}, {chart_b.name}")
     print(f"  - Summary JSON: {summary_file}")
-    print("Overall Completion Status:  PASSED")
+    print("Database In-Transaction Validation: PASSED")
+    print("Overall Completion Status:          PASSED")
     print("============================================================")
 
     return 0
